@@ -1,0 +1,117 @@
+
+name: NeXAS UTF-8 Hook - x86
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - test
+    paths:
+      - 'Nepgear/**'
+      - '.github/workflows/build-nexas-x86.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build x86 DLL
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Nepgear x86 without UPX
+        shell: pwsh
+        run: |
+          msbuild ".\Nepgear\Nepgear.vcxproj" `
+            /m `
+            /t:Rebuild `
+            /p:Configuration=Release `
+            /p:Platform=Win32 `
+            /p:NepgearSkipPack=1 `
+            /v:minimal
+
+      - name: Verify DLL
+        shell: pwsh
+        run: |
+          $dll = "Release\winmm.dll"
+
+          if (-not (Test-Path $dll)) {
+            throw "Build output not found: $dll"
+          }
+
+          $bytes = [System.IO.File]::ReadAllBytes($dll)
+
+          if ($bytes.Length -lt 256) {
+            throw "DLL is unexpectedly small."
+          }
+
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+
+          if ($peOffset -lt 0 -or $peOffset + 24 -gt $bytes.Length) {
+            throw "Invalid PE header offset."
+          }
+
+          $signature = [BitConverter]::ToUInt32($bytes, $peOffset)
+
+          if ($signature -ne 0x00004550) {
+            throw "Invalid PE signature."
+          }
+
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+
+          if ($machine -ne 0x014C) {
+            throw "Expected x86 DLL. Machine: 0x$($machine.ToString('X4'))"
+          }
+
+          $sectionCount = [BitConverter]::ToUInt16($bytes, $peOffset + 6)
+          $optionalSize = [BitConverter]::ToUInt16($bytes, $peOffset + 20)
+          $sectionTable = $peOffset + 24 + $optionalSize
+
+          for ($i = 0; $i -lt $sectionCount; $i++) {
+            $offset = $sectionTable + ($i * 40)
+
+            if ($offset + 8 -gt $bytes.Length) {
+              throw "Invalid PE section table."
+            }
+
+            $sectionName = [Text.Encoding]::ASCII.GetString(
+              $bytes, $offset, 8
+            ).Trim([char]0)
+
+            if ($sectionName.StartsWith("UPX")) {
+              throw "UPX section found: $sectionName"
+            }
+          }
+
+          $hash = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
+          Copy-Item $dll "artifacts\winmm.dll"
+
+          $checksum = "$hash  winmm.dll`r`n"
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          [System.IO.File]::WriteAllText(
+            "artifacts\SHA256SUMS.txt",
+            $checksum,
+            $utf8
+          )
+
+          Write-Host "DLL architecture: x86"
+          Write-Host "UPX sections: none"
+          Write-Host "SHA256: $hash"
+          Write-Host "DLL size: $((Get-Item $dll).Length) bytes"
+
+      - name: Upload x86 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeXAS-UTF8-x86-unpacked
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
